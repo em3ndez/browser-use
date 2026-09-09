@@ -108,7 +108,6 @@ def create_history_gif(
 					font_name = os.path.join(CONFIG.WIN_FONT_DIR, font_name + '.ttf')
 				regular_font = ImageFont.truetype(font_name, font_size)
 				title_font = ImageFont.truetype(font_name, title_font_size)
-				goal_font = ImageFont.truetype(font_name, goal_font_size)
 				font_loaded = True
 				break
 			except OSError:
@@ -120,8 +119,6 @@ def create_history_gif(
 	except OSError:
 		regular_font = ImageFont.load_default()
 		title_font = ImageFont.load_default()
-
-		goal_font = regular_font
 
 	# Load logo if requested
 	logo = None
@@ -182,7 +179,7 @@ def create_history_gif(
 		image = Image.open(io.BytesIO(img_data))
 
 		if show_goals and item.model_output:
-			image = _add_overlay_to_image(
+			overlay = _add_overlay_to_image(
 				image=image,
 				step_number=i,
 				goal_text=item.model_output.current_state.next_goal,
@@ -191,22 +188,31 @@ def create_history_gif(
 				margin=margin,
 				logo=logo,
 			)
+			image.close()
+			image = overlay
 
 		images.append(image)
 
-	if images:
-		# Save the GIF
-		images[0].save(
-			output_path,
-			save_all=True,
-			append_images=images[1:],
-			duration=duration,
-			loop=0,
-			optimize=False,
-		)
-		logger.info(f'Created GIF at {output_path}')
-	else:
-		logger.warning('No images found in history to create GIF')
+	try:
+		if images:
+			# Save the GIF
+			images[0].save(
+				output_path,
+				save_all=True,
+				append_images=images[1:],
+				duration=duration,
+				loop=0,
+				optimize=False,
+			)
+			logger.info(f'Created GIF at {output_path}')
+		else:
+			logger.warning('No images found in history to create GIF')
+	finally:
+		# Close all PIL images to release file descriptors
+		for img in images:
+			img.close()
+		if logo:
+			logo.close()
 
 
 def _create_task_frame(
@@ -223,6 +229,7 @@ def _create_task_frame(
 	img_data = base64.b64decode(first_screenshot)
 	template = Image.open(io.BytesIO(img_data))
 	image = Image.new('RGB', template.size, (0, 0, 0))
+	template.close()
 	draw = ImageDraw.Draw(image)
 
 	# Calculate vertical center of image
@@ -236,8 +243,6 @@ def _create_task_frame(
 	# Start with base font size (regular + 16)
 	base_font_size = regular_font.size + 16
 	min_font_size = max(regular_font.size - 10, 16)  # Don't go below 16pt
-	max_font_size = base_font_size  # Cap at the base font size
-
 	# Calculate dynamic font size based on text length and complexity
 	# Longer texts get progressively smaller fonts
 	text_length = len(task)

@@ -27,6 +27,7 @@ from browser_use.filesystem.file_system import FileSystemState
 from browser_use.llm.base import BaseChatModel
 from browser_use.tokens.views import UsageSummary
 from browser_use.tools.registry.views import ActionModel
+from browser_use.utils import collect_sensitive_data_values, redact_sensitive_string
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ class MessageCompactionSettings(BaseModel):
 	"""Summarizes older history into a compact memory block to reduce prompt size."""
 
 	enabled: bool = True
-	compact_every_n_steps: int = 15
+	compact_every_n_steps: int = 25
 	trigger_char_count: int | None = None  # Min char floor; set via trigger_token_count if preferred
 	trigger_token_count: int | None = None  # Alternative to trigger_char_count (~4 chars/token)
 	chars_per_token: float = 4.0
@@ -88,6 +89,7 @@ class AgentSettings(BaseModel):
 	# Loop detection settings
 	loop_detection_window: int = 20  # Rolling window size for action similarity tracking
 	loop_detection_enabled: bool = True  # Whether to enable loop detection nudges
+	max_clickable_elements_length: int = 40000  # Max characters for clickable elements in prompt
 
 
 class PageFingerprint(BaseModel):
@@ -302,13 +304,6 @@ class JudgementResult(BaseModel):
 	)
 
 
-class SimpleJudgeResult(BaseModel):
-	"""Result of lightweight always-on judge that validates agent success claims."""
-
-	is_correct: bool = Field(description='True if the agent response genuinely satisfies the task requirements')
-	reason: str = Field(default='', description='Brief explanation if not correct')
-
-
 class ActionResult(BaseModel):
 	"""Result of executing an action"""
 
@@ -518,28 +513,24 @@ class AgentHistory(BaseModel):
 		if not sensitive_data:
 			return value
 
-		# Collect all sensitive values, immediately converting old format to new format
-		sensitive_values: dict[str, str] = {}
-
-		# Process all sensitive data entries
-		for key_or_domain, content in sensitive_data.items():
-			if isinstance(content, dict):
-				# Already in new format: {domain: {key: value}}
-				for key, val in content.items():
-					if val:  # Skip empty values
-						sensitive_values[key] = val
-			elif content:  # Old format: {key: value} - convert to new format internally
-				# We treat this as if it was {'http*://*': {key_or_domain: content}}
-				sensitive_values[key_or_domain] = content
+		sensitive_values = collect_sensitive_data_values(sensitive_data)
 
 		# If there are no valid sensitive data entries, just return the original value
 		if not sensitive_values:
 			return value
 
-		# Replace all valid sensitive data values with their placeholder tags
-		for key, val in sensitive_values.items():
-			value = value.replace(val, f'<secret>{key}</secret>')
+		return redact_sensitive_string(value, sensitive_values)
 
+	def _filter_sensitive_data_from_value(self, value: Any, sensitive_data: dict[str, str | dict[str, str]] | None) -> Any:
+		"""Recursively filter sensitive data from any supported container or string value"""
+		if isinstance(value, str):
+			return self._filter_sensitive_data_from_string(value, sensitive_data)
+		if isinstance(value, dict):
+			return {key: self._filter_sensitive_data_from_value(item, sensitive_data) for key, item in value.items()}
+		if isinstance(value, list):
+			return [self._filter_sensitive_data_from_value(item, sensitive_data) for item in value]
+		if isinstance(value, tuple):
+			return tuple(self._filter_sensitive_data_from_value(item, sensitive_data) for item in value)
 		return value
 
 	def _filter_sensitive_data_from_dict(
@@ -549,24 +540,7 @@ class AgentHistory(BaseModel):
 		if not sensitive_data:
 			return data
 
-		filtered_data = {}
-		for key, value in data.items():
-			if isinstance(value, str):
-				filtered_data[key] = self._filter_sensitive_data_from_string(value, sensitive_data)
-			elif isinstance(value, dict):
-				filtered_data[key] = self._filter_sensitive_data_from_dict(value, sensitive_data)
-			elif isinstance(value, list):
-				filtered_data[key] = [
-					self._filter_sensitive_data_from_string(item, sensitive_data)
-					if isinstance(item, str)
-					else self._filter_sensitive_data_from_dict(item, sensitive_data)
-					if isinstance(item, dict)
-					else item
-					for item in value
-				]
-			else:
-				filtered_data[key] = value
-		return filtered_data
+		return {key: self._filter_sensitive_data_from_value(value, sensitive_data) for key, value in data.items()}
 
 	def model_dump(self, sensitive_data: dict[str, str | dict[str, str]] | None = None, **kwargs) -> dict[str, Any]:
 		"""Custom serialization handling circular references and filtering sensitive data"""
@@ -651,7 +625,7 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 			Path(filepath).parent.mkdir(parents=True, exist_ok=True)
 			data = self.model_dump(sensitive_data=sensitive_data)
 			with open(filepath, 'w', encoding='utf-8') as f:
-				json.dump(data, f, indent=2)
+				json.dump(data, f, indent=2, ensure_ascii=False)
 		except Exception as e:
 			raise e
 
@@ -696,14 +670,18 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 	@classmethod
 	def load_from_dict(cls, data: dict[str, Any], output_model: type[AgentOutput]) -> AgentHistoryList:
 		# loop through history and validate output_model actions to enrich with custom actions
-		for h in data['history']:
-			if h['model_output']:
-				if isinstance(h['model_output'], dict):
-					h['model_output'] = output_model.model_validate(h['model_output'])
+		for h in data.get('history', []):
+			# Use .get() to avoid KeyError on incomplete or legacy history entries
+			model_output = h.get('model_output')
+			if model_output:
+				if isinstance(model_output, dict):
+					h['model_output'] = output_model.model_validate(model_output)
 				else:
 					h['model_output'] = None
-			if 'interacted_element' not in h['state']:
-				h['state']['interacted_element'] = None
+			state = h.get('state') or {}
+			if 'interacted_element' not in state:
+				state['interacted_element'] = None
+				h['state'] = state
 
 		history = cls.model_validate(data)
 		return history
@@ -718,7 +696,9 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 	def last_action(self) -> None | dict:
 		"""Last action in history"""
 		if self.history and self.history[-1].model_output:
-			return self.history[-1].model_output.action[-1].model_dump(exclude_none=True, mode='json')
+			actions = self.history[-1].model_output.action
+			if actions:
+				return actions[-1].model_dump(exclude_none=True, mode='json')
 		return None
 
 	def errors(self) -> list[str | None]:
@@ -733,8 +713,10 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 
 	def final_result(self) -> None | str:
 		"""Final result from history"""
-		if self.history and self.history[-1].result[-1].extracted_content:
-			return self.history[-1].result[-1].extracted_content
+		if self.history and len(self.history[-1].result) > 0:
+			last_result = self.history[-1].result[-1]
+			if last_result.extracted_content:
+				return last_result.extracted_content
 		return None
 
 	def is_done(self) -> bool:

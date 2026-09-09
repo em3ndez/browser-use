@@ -36,7 +36,7 @@ uv sync
 To get started with Browser Use you need to install the package and create an `.env` file with your API key.
 
 <Note icon="key" color="#FFC107" iconType="regular">
-  `ChatBrowserUse` offers the [fastest and most cost-effective models](https://browser-use.com/posts/speed-matters/), completing tasks 3-5x faster. Get started with \$10 of [free LLM credits](https://cloud.browser-use.com/new-api-key).
+  `ChatBrowserUse` offers the [fastest and most cost-effective models](https://browser-use.com/posts/speed-matters/), completing tasks 3-5x faster. Get your API key at [cloud.browser-use.com](https://cloud.browser-use.com/new-api-key).
 </Note>
 
 ## 1. Installing Browser-Use
@@ -61,7 +61,7 @@ uvx browser-use install
 Create a `.env` file and add your API key.
 
 <Callout icon="key" iconType="regular">
-  We recommend using ChatBrowserUse which is optimized for browser automation tasks (highest accuracy + fastest speed + lowest token cost). Don't have one? We give you **\$10** to try it out [here](https://cloud.browser-use.com/new-api-key).
+  We recommend using ChatBrowserUse which is optimized for browser automation tasks (highest accuracy + fastest speed + lowest token cost). Get your API key [here](https://cloud.browser-use.com/new-api-key).
 </Callout>
 
 ```bash .env theme={null}
@@ -76,7 +76,7 @@ Then add your API key to the file.
   ```bash Browser Use theme={null}
   # add your key to .env file
   BROWSER_USE_API_KEY=
-  # Get 10$ of free credits at https://cloud.browser-use.com/new-api-key
+  # Get your API key at https://cloud.browser-use.com/new-api-key
   ```
 
   ```bash Google theme={null}
@@ -126,7 +126,7 @@ See [Supported Models](https://docs.browser-use.com/supported-models#supported-m
   load_dotenv()
 
   async def main():
-      llm = ChatGoogle(model="gemini-flash-latest")
+      llm = ChatGoogle(model="gemini-3-flash-preview")
       task = "Find the number 1 post on Show HN"
       agent = Agent(task=task, llm=llm)
       await agent.run()
@@ -235,11 +235,7 @@ To use your local authentication in production:
 
 **First**, create an API key at [cloud.browser-use.com/new-api-key](https://cloud.browser-use.com/new-api-key) or follow the instruction on [Cloud - Profiles](https://cloud.browser-use.com/dashboard/settings?tab=profiles)
 
-**Then**, sync your local cookies:
-
-```bash  theme={null}
-export BROWSER_USE_API_KEY=your_key && curl -fsSL https://browser-use.com/profile.sh | sh
-```
+**Then**, install `profile-use` for your platform from the [official releases](https://github.com/browser-use/profile-use-releases/releases/latest) and follow the [profile sync guide](https://github.com/browser-use/browser-harness/blob/main/interaction-skills/profile-sync.md) to sync your local cookies.
 
 This opens a browser where you log into your accounts. You'll get a `profile_id`.
 
@@ -256,7 +252,7 @@ Your cloud browser is already logged in!
 
 ***
 
-For more sandbox parameters and events, see [Sandbox Quickstart](https://docs.browser-use.com/customize/sandbox/quickstart).
+For more sandbox parameters and events, see [Sandbox Quickstart](https://docs.browser-use.com/legacy/sandbox/quickstart).
 
 # Agent Basics
 ```python  theme={null}
@@ -538,7 +534,7 @@ async def main():
 > Complete reference for all browser configuration options
 
 <Note>
-  The `Browser` instance also provides all [Actor](https://docs.browser-use.com/customize/actor/all-parameters) methods for direct browser control (page management, element interactions, etc.).
+  The `Browser` instance also provides all [Actor](https://docs.browser-use.com/legacy/actor/all-parameters) methods for direct browser control (page management, element interactions, etc.).
 </Note>
 
 ## Core Settings
@@ -798,7 +794,7 @@ The agent injects parameters by name matching, so using the wrong name will caus
 </Warning>
 
 <Note>
-  Use `browser_session` parameter in tools for deterministic [Actor](https://docs.browser-use.com/customize/actor/basics) actions.
+  Use `browser_session` parameter in tools for deterministic [Actor](https://docs.browser-use.com/legacy/actor/basics) actions.
 </Note>
 
 

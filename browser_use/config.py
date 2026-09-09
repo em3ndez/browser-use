@@ -76,6 +76,13 @@ class OldConfig:
 			raise AssertionError('BROWSER_USE_CLOUD_UI_URL must be a valid URL if set')
 		return url
 
+	@property
+	def BROWSER_USE_MODEL_PRICING_URL(self) -> str:
+		url = os.getenv('BROWSER_USE_MODEL_PRICING_URL', '')
+		if url and '://' not in url:
+			raise AssertionError('BROWSER_USE_MODEL_PRICING_URL must be a valid URL if set')
+		return url
+
 	# Path configuration
 	@property
 	def XDG_CACHE_HOME(self) -> Path:
@@ -195,6 +202,7 @@ class FlatEnvConfig(BaseSettings):
 	BROWSER_USE_CLOUD_SYNC: bool | None = Field(default=None)
 	BROWSER_USE_CLOUD_API_URL: str = Field(default='https://api.browser-use.com')
 	BROWSER_USE_CLOUD_UI_URL: str = Field(default='')
+	BROWSER_USE_MODEL_PRICING_URL: str = Field(default='')
 
 	# Path configuration
 	XDG_CACHE_HOME: str = Field(default='~/.cache')
@@ -222,6 +230,7 @@ class FlatEnvConfig(BaseSettings):
 	# MCP-specific env vars
 	BROWSER_USE_CONFIG_PATH: str | None = Field(default=None)
 	BROWSER_USE_HEADLESS: bool | None = Field(default=None)
+	BROWSER_USE_DISABLE_SECURITY: bool | None = Field(default=None)
 	BROWSER_USE_ALLOWED_DOMAINS: str | None = Field(default=None)
 	BROWSER_USE_LLM_MODEL: str | None = Field(default=None)
 
@@ -463,6 +472,9 @@ class Config:
 		# Apply MCP-specific env var overrides
 		if env_config.BROWSER_USE_HEADLESS is not None:
 			config['browser_profile']['headless'] = env_config.BROWSER_USE_HEADLESS
+
+		if env_config.BROWSER_USE_DISABLE_SECURITY is not None:
+			config['browser_profile']['disable_security'] = env_config.BROWSER_USE_DISABLE_SECURITY
 
 		if env_config.BROWSER_USE_ALLOWED_DOMAINS:
 			domains = [d.strip() for d in env_config.BROWSER_USE_ALLOWED_DOMAINS.split(',') if d.strip()]

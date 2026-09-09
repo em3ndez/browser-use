@@ -18,6 +18,18 @@ class SensitiveParams(BaseModel):
 	text: str = Field(description='Text with sensitive data placeholders')
 
 
+class TupleSensitiveParams(BaseModel):
+	"""Test parameter model for tuple-based sensitive data placeholders."""
+
+	items: tuple[str, ...] = Field(description='Tuple with sensitive data placeholders')
+
+
+class NestedTupleSensitiveParams(BaseModel):
+	"""Test parameter model for nested tuple-based sensitive data placeholders."""
+
+	payload: tuple[dict[str, tuple[str, list[str]]], ...] = Field(description='Nested tuple with sensitive data placeholders')
+
+
 @pytest.fixture
 def registry():
 	return Registry()
@@ -70,6 +82,29 @@ def test_replace_sensitive_data_with_missing_keys(registry, caplog):
 	assert result.text == 'Please enter user123 and <secret>password</secret>'
 	assert 'user123' in result.text
 	assert '<secret>password</secret>' in result.text  # Empty value's tag remains
+
+
+def test_replace_sensitive_data_inside_tuple(registry):
+	"""Test that _replace_sensitive_data replaces placeholders inside tuple fields."""
+	params = TupleSensitiveParams(items=('<secret>api_key</secret>', 'username', 'unchanged'))
+	sensitive_data = {'api_key': 'sk-replaced', 'username': 'admin_user'}
+
+	result = registry._replace_sensitive_data(params, sensitive_data)
+
+	assert result.items == ('sk-replaced', 'admin_user', 'unchanged')
+	assert isinstance(result.items, tuple)
+
+
+def test_replace_sensitive_data_inside_nested_tuple(registry):
+	"""Test that _replace_sensitive_data replaces placeholders inside nested tuples."""
+	params = NestedTupleSensitiveParams(payload=({'credentials': ('<secret>token</secret>', ['<secret>username</secret>'])},))
+	sensitive_data = {'token': 'token-replaced', 'username': 'admin_user'}
+
+	result = registry._replace_sensitive_data(params, sensitive_data)
+
+	assert result.payload == ({'credentials': ('token-replaced', ['admin_user'])},)
+	assert isinstance(result.payload, tuple)
+	assert isinstance(result.payload[0]['credentials'], tuple)
 
 
 def test_simple_domain_specific_sensitive_data(registry, caplog):
@@ -436,3 +471,202 @@ def test_sensitive_data_filtered_with_domain_specific_format():
 	# API key should be filtered out
 	assert 'sk-secret-api-key-12345' not in combined_text, 'API key leaked into LLM messages!'
 	assert '<secret>api_key</secret>' in combined_text, 'API key placeholder not found in messages'
+
+
+# ─── Tests for password field value redaction in DOM snapshots ────────────────
+
+
+def _make_dom_node(
+	tag_name: str,
+	attributes: dict[str, str],
+	ax_value: str | None = None,
+):
+	"""Create a minimal EnhancedDOMTreeNode for serializer testing."""
+	from browser_use.dom.views import (
+		EnhancedAXNode,
+		EnhancedAXProperty,
+		EnhancedDOMTreeNode,
+		NodeType,
+	)
+
+	ax_node = None
+	if ax_value is not None:
+		ax_node = EnhancedAXNode(
+			ax_node_id='ax-1',
+			ignored=False,
+			role='textbox',
+			name=None,
+			description=None,
+			properties=[
+				EnhancedAXProperty(name='valuetext', value=ax_value),
+			],
+			child_ids=None,
+		)
+
+	return EnhancedDOMTreeNode(
+		node_id=1,
+		backend_node_id=1,
+		node_type=NodeType.ELEMENT_NODE,
+		node_name=tag_name.upper(),
+		node_value='',
+		attributes=attributes,
+		is_scrollable=None,
+		is_visible=True,
+		absolute_position=None,
+		target_id='target-1',
+		frame_id=None,
+		session_id=None,
+		content_document=None,
+		shadow_root_type=None,
+		shadow_roots=None,
+		parent_node=None,
+		children_nodes=None,
+		ax_node=ax_node,
+		snapshot_node=None,
+	)
+
+
+def test_password_field_value_excluded_from_dom_snapshot():
+	"""
+	Password field values must never appear in DOM snapshots sent to the LLM.
+
+	When a user types a password into <input type="password">, the accessibility tree
+	stores the real value. The serializer extracts AX tree values for all form elements
+	to show the LLM what's been typed. Without filtering, the password appears in the
+	DOM text representation sent to the LLM on every subsequent step.
+
+	Attack scenario:
+	1. Agent types password into <input type="password"> via sensitive_data placeholder
+	2. Next step: DOM snapshot extracts the typed value from the AX tree
+	3. Password appears in plaintext in the LLM context
+	4. Prompt injection on a later page can exfiltrate it
+	"""
+	from browser_use.dom.serializer.serializer import DOMTreeSerializer
+	from browser_use.dom.views import DEFAULT_INCLUDE_ATTRIBUTES
+
+	secret_password = 'hubble_space_telescope'
+
+	node = _make_dom_node(
+		tag_name='input',
+		attributes={'type': 'password', 'name': 'password', 'id': 'pw-field'},
+		ax_value=secret_password,
+	)
+
+	attrs_str = DOMTreeSerializer._build_attributes_string(node, list(DEFAULT_INCLUDE_ATTRIBUTES), '')
+
+	assert secret_password not in attrs_str, (
+		f'Password "{secret_password}" leaked into DOM serialization! '
+		'Password field values must be excluded from DOM snapshots sent to the LLM.'
+	)
+	# The type attribute should still be present so the LLM knows it's a password field
+	assert 'type=password' in attrs_str, 'Password field type attribute should be preserved'
+
+
+def test_password_field_value_excluded_even_from_html_attributes():
+	"""
+	Even if the DOM attribute 'value' is set (e.g. <input type="password" value="preset">),
+	the serializer must strip it for password fields.
+	"""
+	from browser_use.dom.serializer.serializer import DOMTreeSerializer
+	from browser_use.dom.views import DEFAULT_INCLUDE_ATTRIBUTES
+
+	preset_password = 'hubble_space_telescope'
+
+	node = _make_dom_node(
+		tag_name='input',
+		attributes={'type': 'password', 'name': 'password', 'value': preset_password},
+		ax_value=None,  # no AX value, but HTML attribute has it
+	)
+
+	attrs_str = DOMTreeSerializer._build_attributes_string(node, list(DEFAULT_INCLUDE_ATTRIBUTES), '')
+
+	assert preset_password not in attrs_str, (
+		f'Preset password "{preset_password}" leaked via HTML value attribute! '
+		'Password field values must be stripped regardless of source.'
+	)
+
+
+def test_text_input_value_preserved():
+	"""Non-password input values should still be included (backward compatibility)."""
+	from browser_use.dom.serializer.serializer import DOMTreeSerializer
+	from browser_use.dom.views import DEFAULT_INCLUDE_ATTRIBUTES
+
+	username = 'john.doe@example.com'
+
+	node = _make_dom_node(
+		tag_name='input',
+		attributes={'type': 'text', 'name': 'username'},
+		ax_value=username,
+	)
+
+	attrs_str = DOMTreeSerializer._build_attributes_string(node, list(DEFAULT_INCLUDE_ATTRIBUTES), '')
+
+	assert username in attrs_str, 'Non-password input values should be preserved in DOM snapshots'
+
+
+def test_password_field_without_type_attribute():
+	"""
+	An input without an explicit type attribute defaults to 'text' — its value
+	should NOT be stripped. Only explicit type="password" fields are protected.
+	"""
+	from browser_use.dom.serializer.serializer import DOMTreeSerializer
+	from browser_use.dom.views import DEFAULT_INCLUDE_ATTRIBUTES
+
+	value = 'some_text_value'
+
+	node = _make_dom_node(
+		tag_name='input',
+		attributes={'name': 'search'},
+		ax_value=value,
+	)
+
+	attrs_str = DOMTreeSerializer._build_attributes_string(node, list(DEFAULT_INCLUDE_ATTRIBUTES), '')
+
+	assert value in attrs_str, 'Input without type attribute should preserve its value'
+
+
+def test_history_filters_sensitive_data_inside_nested_lists(tmp_path):
+	"""
+	Saved history must not leak sensitive values that sit below a nested-list
+	boundary in an action parameter (e.g. a list of rows, each row a list).
+	"""
+	from typing import Any
+
+	from pydantic import create_model
+
+	from browser_use.agent.views import AgentHistory, AgentHistoryList, AgentOutput
+	from browser_use.browser.views import BrowserStateHistory
+	from browser_use.tools.registry.views import ActionModel
+
+	class NestedInputAction(BaseModel):
+		rows: list[list[str]]
+		lookup: dict[str, list[dict[str, str]]]
+
+	InputActionModel = create_model('InputActionModel', __base__=ActionModel, input=(NestedInputAction | None, None))
+	OutputModel = AgentOutput.type_with_custom_actions(InputActionModel)
+
+	# built via model_validate because create_model's field is invisible to static analysis
+	action = InputActionModel.model_validate(
+		{
+			'input': {
+				'rows': [['token-123']],
+				'lookup': {'headers': [{'authorization': 'token-123'}]},
+			}
+		}
+	)
+	history = AgentHistoryList[Any](
+		history=[
+			AgentHistory(
+				model_output=OutputModel(memory='', action=[action]),
+				result=[],
+				state=BrowserStateHistory(url='https://example.test', title='t', tabs=[], interacted_element=[None]),
+			)
+		]
+	)
+
+	filepath = tmp_path / 'history.json'
+	history.save_to_file(filepath, sensitive_data={'api_key': 'token-123'})
+	saved = filepath.read_text(encoding='utf-8')
+
+	assert 'token-123' not in saved, 'Sensitive value leaked into the saved history file'
+	assert saved.count('<secret>api_key</secret>') == 2

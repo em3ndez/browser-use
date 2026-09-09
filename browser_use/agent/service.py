@@ -25,7 +25,7 @@ from browser_use.agent.cloud_events import (
 )
 from browser_use.agent.message_manager.utils import save_conversation
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
+from browser_use.llm.exceptions import ModelOutputTruncatedError, ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage, ContentPartImageParam, ContentPartTextParam, UserMessage
 from browser_use.tokens.service import TokenCost
 
@@ -36,7 +36,7 @@ from pydantic import BaseModel, ValidationError
 from uuid_extensions import uuid7str
 
 from browser_use import Browser, BrowserProfile, BrowserSession
-from browser_use.agent.judge import construct_judge_messages, construct_simple_judge_messages
+from browser_use.agent.judge import construct_judge_messages
 
 # Lazy import for gif to avoid heavy agent.views import at startup
 # from browser_use.agent.gif import create_history_gif
@@ -59,7 +59,6 @@ from browser_use.agent.views import (
 	JudgementResult,
 	MessageCompactionSettings,
 	PlanItem,
-	SimpleJudgeResult,
 	StepMetadata,
 )
 from browser_use.browser.events import _get_timeout
@@ -78,6 +77,9 @@ from browser_use.utils import (
 	_log_pretty_path,
 	check_latest_browser_use_version,
 	get_browser_use_version,
+	has_url_negation,
+	is_placeholder_url,
+	sanitize_url_candidate,
 	time_execution_async,
 	time_execution_sync,
 )
@@ -188,6 +190,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		file_system_path: str | None = None,
 		task_id: str | None = None,
 		calculate_cost: bool = False,
+		pricing_url: str | None = None,
 		display_files_in_done_text: bool = True,
 		include_tool_call_examples: bool = False,
 		vision_detail_level: Literal['auto', 'low', 'high'] = 'auto',
@@ -204,7 +207,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		loop_detection_enabled: bool = True,
 		llm_screenshot_size: tuple[int, int] | None = None,
 		message_compaction: MessageCompactionSettings | bool | None = True,
+		max_clickable_elements_length: int = 40000,
 		_url_shortening_limit: int = 25,
+		enable_signal_handler: bool = True,
 		**kwargs,
 	):
 		# Validate llm_screenshot_size
@@ -237,10 +242,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if flash_mode:
 			enable_planning = False
 
-		# Auto-configure llm_screenshot_size for Claude Sonnet models
+		# Auto-configure llm_screenshot_size for Claude Sonnet, including gateway ids like
+		# 'anthropic/claude-sonnet-4-6' (rsplit drops the provider prefix before matching).
 		if llm_screenshot_size is None:
 			model_name = getattr(llm, 'model', '')
-			if isinstance(model_name, str) and model_name.startswith('claude-sonnet'):
+			if isinstance(model_name, str) and model_name.rsplit('/', 1)[-1].startswith('claude-sonnet'):
 				llm_screenshot_size = (1400, 850)
 				logger.info('🖼️  Auto-configured LLM screenshot size for Claude Sonnet: 1400x850')
 
@@ -320,7 +326,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Enable coordinate clicking for models that support it
 		model_name = getattr(llm, 'model', '').lower()
 		supports_coordinate_clicking = any(
-			pattern in model_name for pattern in ['claude-sonnet-4', 'claude-opus-4', 'gemini-3-pro', 'browser-use/']
+			pattern in model_name
+			for pattern in ['claude-sonnet-4', 'claude-opus-4', 'claude-fable-5', 'gemini-3-pro', 'browser-use/']
 		)
 		if supports_coordinate_clicking:
 			self.tools.set_coordinate_clicking(True)
@@ -356,10 +363,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if self.output_model_schema is not None:
 			self.tools.use_structured_output_action(self.output_model_schema)
 
-		# Extraction schema: explicit param takes priority, otherwise auto-bridge from output_model_schema
+		# Per-page extract uses a schema only when the caller explicitly asks for one.
+		# It must NOT inherit output_model_schema: that describes the final task result
+		# (e.g. {summary, step_results}), which is the wrong shape for a single-page
+		# extraction and, on the browser-use gateway, routes extract into the agent
+		# action protocol and breaks it.
 		self.extraction_schema = extraction_schema
-		if self.extraction_schema is None and self.output_model_schema is not None:
-			self.extraction_schema = self.output_model_schema.model_json_schema()
 
 		# Core components - task enhancement now has access to output_model_schema from tools
 		self.task = self._enhance_task_with_schema(task, output_model_schema)
@@ -409,15 +418,19 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			loop_detection_window=loop_detection_window,
 			loop_detection_enabled=loop_detection_enabled,
 			message_compaction=message_compaction,
+			max_clickable_elements_length=max_clickable_elements_length,
 		)
 
 		# Token cost service
-		self.token_cost_service = TokenCost(include_cost=calculate_cost)
+		self.token_cost_service = TokenCost(include_cost=calculate_cost, pricing_url=pricing_url)
 		self.token_cost_service.register_llm(llm)
 		self.token_cost_service.register_llm(page_extraction_llm)
 		self.token_cost_service.register_llm(judge_llm)
 		if self.settings.message_compaction and self.settings.message_compaction.compaction_llm:
 			self.token_cost_service.register_llm(self.settings.message_compaction.compaction_llm)
+
+		# Store signal handler setting (not part of AgentSettings as it's runtime behavior)
+		self.enable_signal_handler = enable_signal_handler
 
 		# Initialize state
 		self.state = injected_agent_state or AgentState()
@@ -514,6 +527,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			include_recent_events=self.include_recent_events,
 			sample_images=self.sample_images,
 			llm_screenshot_size=llm_screenshot_size,
+			max_clickable_elements_length=self.settings.max_clickable_elements_length,
 		)
 
 		if self.sensitive_data:
@@ -663,11 +677,16 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if not self.has_downloads_path:
 			return
 
-		current_files = set(self.available_file_paths or [])
-		new_files = set(downloads) - current_files
+		available_files = self.available_file_paths or []
+		seen_files = set(available_files)
+		new_files = []
+		for download in downloads:
+			if download not in seen_files:
+				seen_files.add(download)
+				new_files.append(download)
 
 		if new_files:
-			self.available_file_paths = list(current_files | new_files)
+			self.available_file_paths = [*available_files, *new_files]
 
 			self.logger.info(
 				f'📁 Added {len(new_files)} downloaded files to available_file_paths (total: {len(self.available_file_paths)} files)'
@@ -675,7 +694,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			for file_path in new_files:
 				self.logger.info(f'📄 New file available: {file_path}')
 		else:
-			self.logger.debug(f'📁 No new downloads detected (tracking {len(current_files)} files)')
+			self.logger.debug(f'📁 No new downloads detected (tracking {len(available_files)} files)')
 
 	def _set_file_system(self, file_system_path: str | None = None) -> None:
 		# Check for conflicting parameters
@@ -1022,8 +1041,34 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		browser_state_summary = None
 
 		try:
+			if self.browser_session:
+				try:
+					captcha_wait = await self.browser_session.wait_if_captcha_solving()
+					if captcha_wait and captcha_wait.waited:
+						# Reset step timing to exclude the captcha wait from step duration metrics
+						self.step_start_time = time.time()
+						duration_s = captcha_wait.duration_ms / 1000
+						outcome = captcha_wait.result  # 'success' | 'failed' | 'timeout'
+						msg = f'Waited {duration_s:.1f}s for {captcha_wait.vendor} CAPTCHA to be solved. Result: {outcome}.'
+						self.logger.info(f'🔒 {msg}')
+						# Inject the outcome so the LLM sees what happened
+						captcha_result = ActionResult(long_term_memory=msg)
+						if self.state.last_result:
+							self.state.last_result.append(captcha_result)
+						else:
+							self.state.last_result = [captcha_result]
+				except Exception as e:
+					self.logger.warning(f'Phase 0 captcha wait failed (non-fatal): {e}')
+
 			# Phase 1: Prepare context and timing
 			browser_state_summary = await self._prepare_context(step_info)
+
+			# Clear previous step state after context preparation (which needs
+			# them for the "previous action result" prompt) but before the LLM
+			# call, so a timeout during _get_next_action or _execute_actions
+			# won't leave stale data from the previous step.
+			self.state.last_model_output = None
+			self.state.last_result = None
 
 			# Phase 2: Get model output and execute actions
 			await self._get_next_action(browser_state_summary)
@@ -1220,12 +1265,31 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.warning(f'{error_msg}')
 			return
 
-		# Handle browser closed/disconnected errors - stop immediately instead of retrying
-		if self._is_browser_closed_error(error):
-			self.logger.warning(f'🛑 Browser closed or disconnected: {error}')
-			self.state.stopped = True
-			self._external_pause_event.set()
-			return
+		# Handle browser closed/disconnected errors
+		if self._is_connection_like_error(error):
+			# If reconnection is in progress, wait for it instead of stopping
+			if self.browser_session.is_reconnecting:
+				wait_timeout = self.browser_session.RECONNECT_WAIT_TIMEOUT
+				self.logger.warning(
+					f'🔄 Connection error during reconnection, waiting up to {wait_timeout}s for reconnect: {error}'
+				)
+				try:
+					await asyncio.wait_for(self.browser_session._reconnect_event.wait(), timeout=wait_timeout)
+				except TimeoutError:
+					pass
+
+				# Check if reconnection succeeded
+				if self.browser_session.is_cdp_connected:
+					self.logger.info('🔄 Reconnection succeeded, retrying step...')
+					self.state.last_result = [ActionResult(error=f'Connection lost and recovered: {error}')]
+					return
+
+			# Not reconnecting or reconnection failed — check if truly terminal
+			if self._is_browser_closed_error(error):
+				self.logger.warning(f'🛑 Browser closed or disconnected: {error}')
+				self.state.stopped = True
+				self._external_pause_event.set()
+				return
 
 		# Handle all other exceptions
 		include_trace = self.logger.isEnabledFor(logging.DEBUG)
@@ -1249,14 +1313,35 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.state.last_result = [ActionResult(error=error_msg)]
 		return None
 
+	def _is_connection_like_error(self, error: Exception) -> bool:
+		"""Check if the error looks like a CDP/WebSocket connection failure.
+
+		Unlike _is_browser_closed_error(), this does NOT check if the CDP client is None
+		or if reconnection is in progress — it purely looks at the error signature.
+		"""
+		error_str = str(error).lower()
+		return (
+			isinstance(error, ConnectionError)
+			or 'websocket connection closed' in error_str
+			or 'connection closed' in error_str
+			or 'browser has been closed' in error_str
+			or 'browser closed' in error_str
+			or 'no browser' in error_str
+		)
+
 	def _is_browser_closed_error(self, error: Exception) -> bool:
 		"""Check if the browser has been closed or disconnected.
 
 		Only returns True when the error itself is a CDP/WebSocket connection failure
-		AND the CDP client is gone. Avoids false positives on unrelated errors
-		(element not found, timeouts, parse errors) that happen to coincide with
-		a transient None state during reconnects or resets.
+		AND the CDP client is gone AND we're not actively reconnecting.
+		Avoids false positives on unrelated errors (element not found, timeouts,
+		parse errors) that happen to coincide with a transient None state during
+		reconnects or resets.
 		"""
+		# During reconnection, don't treat connection errors as terminal
+		if self.browser_session.is_reconnecting:
+			return False
+
 		error_str = str(error).lower()
 		is_connection_error = (
 			isinstance(error, ConnectionError)
@@ -1460,7 +1545,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		This gives the LLM advance notice to wrap up, save partial results, and call done
 		rather than exhausting all steps with nothing saved.
 		"""
-		if step_info is None:
+		if step_info is None or step_info.max_steps <= 0:
 			return
 
 		steps_used = step_info.step_number + 1  # Convert 0-indexed to 1-indexed
@@ -1504,46 +1589,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self._message_manager._add_context_message(UserMessage(content=msg))
 			self.AgentOutput = self.DoneAgentOutput
 
-	async def _run_simple_judge(self) -> None:
-		"""Lightweight always-on judge that overrides agent success when it overclaims.
-
-		Runs regardless of use_judge setting. Only checks tasks where the agent
-		claimed success — if the agent already reports failure, there's nothing to correct.
-		"""
-		last_result = self.history.history[-1].result[-1]
-		if not last_result.is_done or not last_result.success:
-			return
-
-		task = self.task
-		final_result = self.history.final_result() or ''
-
-		messages = construct_simple_judge_messages(
-			task=task,
-			final_result=final_result,
-		)
-
-		try:
-			response = await self.llm.ainvoke(messages, output_format=SimpleJudgeResult)
-			result: SimpleJudgeResult = response.completion  # type: ignore[assignment]
-			if not result.is_correct:
-				reason = result.reason or 'Task requirements not fully met'
-				self.logger.info(f'⚠️  Simple judge overriding success to failure: {reason}')
-				last_result.success = False
-				note = f'[Simple judge: {reason}]'
-				# When structured output is expected, don't append judge text to extracted_content
-				# as it would corrupt the JSON and break end-user parsers
-				if self.output_model_schema is not None:
-					if last_result.metadata is None:
-						last_result.metadata = {}
-					last_result.metadata['simple_judge'] = note
-				elif last_result.extracted_content:
-					last_result.extracted_content += f'\n\n{note}'
-				else:
-					last_result.extracted_content = note
-		except Exception as e:
-			self.logger.warning(f'Simple judge failed with error: {e}')
-			# Don't override on error — keep the agent's self-report
-
 	@observe(ignore_input=True, ignore_output=False)
 	async def _judge_trace(self) -> JudgementResult | None:
 		"""Judge the trace of the agent"""
@@ -1569,6 +1614,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Only pass request_type for ChatBrowserUse (other providers don't support it)
 		if self.judge_llm.provider == 'browser-use':
 			kwargs['request_type'] = 'judge'
+			kwargs['session_id'] = self.session_id
 
 		try:
 			response = await self.judge_llm.ainvoke(input_messages, **kwargs)
@@ -1614,8 +1660,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				if judgement.failure_reason:
 					judge_log += f'   Failure Reason: {judgement.failure_reason}\n'
 				if judgement.reached_captcha:
-					judge_log += '   🤖 Captcha Detected: Agent encountered captcha challenges\n'
-					judge_log += '   👉 🥷 Use Browser Use Cloud for the most stealth browser infra: https://docs.browser-use.com/customize/browser/remote\n'
+					self.logger.warning(
+						'Agent was blocked by a captcha. Cloud browsers include stealth fingerprinting and proxy rotation to avoid this.\n'
+						'         Try: Browser(use_cloud=True)  |  Get an API key: https://cloud.browser-use.com?utm_source=oss&utm_medium=captcha_nudge'
+					)
 				judge_log += f'   {judgement.reasoning}\n'
 				self.logger.info(judge_log)
 
@@ -1951,8 +1999,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# 402: Insufficient credits/payment required - fallback to different provider
 		# 429: Rate limit exceeded
 		# 500, 502, 503, 504: Server errors
+		# ModelOutputTruncatedError: not retryable on the same model, but a fallback may have a higher cap
 		retryable_status_codes = {401, 402, 429, 500, 502, 503, 504}
-		is_retryable = isinstance(error, ModelRateLimitError) or (
+		is_retryable = isinstance(error, (ModelRateLimitError, ModelOutputTruncatedError)) or (
 			hasattr(error, 'status_code') and error.status_code in retryable_status_codes
 		)
 
@@ -2022,8 +2071,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		"""Log a comprehensive summary of the next action(s)"""
 		if not (self.logger.isEnabledFor(logging.DEBUG) and parsed.action):
 			return
-
-		action_count = len(parsed.action)
 
 		# Collect action details
 		action_details = []
@@ -2129,11 +2176,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			has_captcha_issue = any(keyword in final_result_str for keyword in captcha_keywords)
 
 			if has_captcha_issue:
-				# Suggest use_cloud=True for captcha/cloudflare issues
-				task_preview = self.task[:10] if len(self.task) > 10 else self.task
-				self.logger.info('')
-				self.logger.info('Failed because of CAPTCHA? For better browser stealth, try:')
-				self.logger.info(f'   agent = Agent(task="{task_preview}...", browser=Browser(use_cloud=True))')
+				self.logger.warning(
+					'Agent was blocked by a captcha. Cloud browsers include stealth fingerprinting and proxy rotation to avoid this.\n'
+					'         Try: Browser(use_cloud=True)  |  Get an API key: https://cloud.browser-use.com?utm_source=oss&utm_medium=captcha_nudge'
+				)
 
 			# General failure message
 			self.logger.info('')
@@ -2225,9 +2271,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		await self.step(step_info)
 
 		if self.history.is_done():
-			# Always run simple judge to align agent success with reality
-			await self._run_simple_judge()
-
 			await self.log_completion()
 
 			# Run full judge before done callback if enabled
@@ -2253,7 +2296,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		# Look for common URL patterns
 		patterns = [
-			r'https?://[^\s<>"\']+',  # Full URLs with http/https
+			r'(?:https?|file)://[^\s<>"\']+',  # Full URLs
 			r'(?:www\.)?[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,}(?:/[^\s<>"\']*)?',  # Domain names with subdomains and optional paths
 		]
 
@@ -2330,46 +2373,52 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			'polynomial',
 		}
 
-		excluded_words = {
-			'never',
-			'dont',
-			'not',
-			"don't",
-		}
-
 		found_urls = []
+		matched_spans: list[tuple[int, int]] = []
 		for pattern in patterns:
 			matches = re.finditer(pattern, task_without_emails)
 			for match in matches:
 				url = match.group(0)
 				original_position = match.start()  # Store original position before URL modification
 
-				# Remove trailing punctuation that's not part of URLs
-				url = re.sub(r'[.,;:!?()\[\]]+$', '', url)
+				# Skip fragments of URLs already matched by earlier pattern
+				if any(match.start() < end and match.end() > start for start, end in matched_spans):
+					continue
+				matched_spans.append((match.start(), match.end()))
 
-				# Check if URL ends with a file extension that should be excluded
+				# Remove trailing punctuation that's not part of URLs
+				url = sanitize_url_candidate(url)
+
+				if is_placeholder_url(url):
+					self.logger.debug(f'Excluding placeholder URL from auto-navigation: {url}')
+					continue
+
 				url_lower = url.lower()
+				has_scheme = url_lower.startswith(('http://', 'https://', 'file://'))
+
+				# Check if URL ends with file extension
 				should_exclude = False
-				for ext in excluded_extensions:
-					if f'.{ext}' in url_lower:
+				if not url_lower.startswith('file://'):
+					for ext in excluded_extensions:
+						if f'.{ext}' in url_lower:
+							should_exclude = True
+							break
+					if not has_scheme and '.htm' in url_lower:
 						should_exclude = True
-						break
 
 				if should_exclude:
 					self.logger.debug(f'Excluding URL with file extension from auto-navigation: {url}')
 					continue
 
-				# If in the 20 characters before the url position is a word in excluded_words skip to avoid "Never go to this url"
+				# Skip URLs explicitly negated by nearby prose, such as "Never go to this URL".
 				context_start = max(0, original_position - 20)
 				context_text = task_without_emails[context_start:original_position]
-				if any(word.lower() in context_text.lower() for word in excluded_words):
-					self.logger.debug(
-						f'Excluding URL with word in excluded words from auto-navigation: {url} (context: "{context_text.strip()}")'
-					)
+				if has_url_negation(context_text):
+					self.logger.debug(f'Excluding negated URL from auto-navigation: {url} (context: "{context_text.strip()}")')
 					continue
 
-				# Add https:// if missing (after excluded words check to avoid position calculation issues)
-				if not url.startswith(('http://', 'https://')):
+				# Add https:// after the negation check to preserve source positions.
+				if not has_scheme:
 					url = 'https://' + url
 
 				found_urls.append(url)
@@ -2424,14 +2473,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			await self._demo_mode_log(error_msg, 'error', {'step': step + 1})
 			self.state.consecutive_failures += 1
 			self.state.last_result = [ActionResult(error=error_msg)]
+			# Ensure step counter advances on timeout — _finalize() may have
+			# been skipped or returned early due to the cancellation.
+			if self.state.n_steps == step + 1:
+				self.state.n_steps += 1
 
 		if on_step_end is not None:
 			await on_step_end(self)
 
 		if self.history.is_done():
-			# Always run simple judge to align agent success with reality
-			await self._run_simple_judge()
-
 			await self.log_completion()
 
 			# Run full judge before done callback if enabled
@@ -2480,6 +2530,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			resume_callback=self.resume,
 			custom_exit_callback=on_force_exit_log_telemetry,  # Pass the new telemetrycallback
 			exit_on_second_int=True,
+			disabled=not self.enable_signal_handler,
 		)
 		signal_handler.register()
 
@@ -2521,11 +2572,25 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			# Register skills as actions if SkillService is configured
 			await self._register_skills_as_actions()
 
-			# Normally there was no try catch here but the callback can raise an InterruptedError
+			# Normally there was no try catch here but the callback can raise an InterruptedError.
+			# Wrap with step_timeout so initial actions (usually a single URL navigate) can't
+			# hang indefinitely on a silent CDP WebSocket — without this the agent would take
+			# zero steps and return with an empty history while any outer watchdog waits.
 			try:
-				await self._execute_initial_actions()
+				await asyncio.wait_for(
+					self._execute_initial_actions(),
+					timeout=self.settings.step_timeout,
+				)
 			except InterruptedError:
 				pass
+			except TimeoutError:
+				initial_timeout_msg = (
+					f'Initial actions timed out after {self.settings.step_timeout}s '
+					f'(browser may be unresponsive). Proceeding to main execution loop.'
+				)
+				self.logger.error(f'⏰ {initial_timeout_msg}')
+				self.state.last_result = [ActionResult(error=initial_timeout_msg)]
+				self.state.consecutive_failures += 1
 			except Exception as e:
 				raise e
 
@@ -2672,7 +2737,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		     to pre-action values. Any change aborts the remaining queue.
 		"""
 		results: list[ActionResult] = []
-		time_elapsed = 0
 		total_actions = len(actions)
 
 		assert self.browser_session is not None, 'BrowserSession is not set up'
@@ -2682,19 +2746,20 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				and self.browser_session._cached_browser_state_summary.dom_state is not None
 			):
 				cached_selector_map = dict(self.browser_session._cached_browser_state_summary.dom_state.selector_map)
-				cached_element_hashes = {e.parent_branch_hash() for e in cached_selector_map.values()}
 			else:
 				cached_selector_map = {}
-				cached_element_hashes = set()
 		except Exception as e:
 			self.logger.error(f'Error getting cached selector map: {e}')
 			cached_selector_map = {}
-			cached_element_hashes = set()
 
 		for i, action in enumerate(actions):
+			# Get action name from the action model BEFORE try block to ensure it's always available in except
+			action_data = action.model_dump(exclude_unset=True)
+			action_name = next(iter(action_data.keys())) if action_data else 'unknown'
+
 			if i > 0:
 				# ONLY ALLOW TO CALL `done` IF IT IS A SINGLE ACTION
-				if action.model_dump(exclude_unset=True).get('done') is not None:
+				if action_data.get('done') is not None:
 					msg = f'Done action is allowed only as a single action - stopped after action {i} / {total_actions}.'
 					self.logger.debug(msg)
 					break
@@ -2706,9 +2771,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 			try:
 				await self._check_stop_or_pause()
-				# Get action name from the action model
-				action_data = action.model_dump(exclude_unset=True)
-				action_name = next(iter(action_data.keys())) if action_data else 'unknown'
 
 				# Log action before execution
 				await self._log_action(action, action_name, i + 1, total_actions)
@@ -2716,8 +2778,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				# Capture pre-action state for runtime page-change detection
 				pre_action_url = await self.browser_session.get_current_page_url()
 				pre_action_focus = self.browser_session.agent_focus_target_id
-
-				time_start = time.time()
 
 				result = await self.tools.act(
 					action=action,
@@ -2728,9 +2788,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					available_file_paths=self.available_file_paths,
 					extraction_schema=self.extraction_schema,
 				)
-
-				time_end = time.time()
-				time_elapsed = time_end - time_start
 
 				if result.error:
 					await self._demo_mode_log(
@@ -2771,6 +2828,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					break
 
 			except Exception as e:
+				# Re-raise InterruptedError so _check_stop_or_pause's stop/pause signal still propagates
+				if isinstance(e, InterruptedError):
+					raise
+				# Re-raise browser/connection errors so _handle_step_error can handle reconnect/shutdown
+				if self._is_connection_like_error(e):
+					raise
 				# Handle any exceptions during action execution
 				self.logger.error(f'❌ Executing action {i + 1} failed -> {type(e).__name__}: {e}')
 				await self._demo_mode_log(
@@ -2778,7 +2841,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					'error',
 					{'action': action_name, 'step': self.state.n_steps},
 				)
-				raise e
+				# Preserve partial results so the agent knows which actions succeeded before the failure
+				results.append(ActionResult(error=f'{type(e).__name__}: {e}'))
+				return results
 
 		return results
 
@@ -3429,7 +3494,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					hist_node = historical_elem.node_name.lower() if historical_elem else ''
 					similar_elements = []
 					if historical_elem and historical_elem.attributes:
-						hist_aria = historical_elem.attributes.get('aria-label', '')
 						for idx, elem in selector_map.items():
 							if elem.node_name.lower() == hist_node and elem.attributes:
 								elem_aria = elem.attributes.get('aria-label', '')
@@ -3483,6 +3547,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			return action
 
 		selector_map = browser_state_summary.dom_state.selector_map
+		selector_items = list(selector_map.items())
+		if historical_element.frame_id:
+			same_frame_items = [
+				(index, element) for index, element in selector_items if element.frame_id == historical_element.frame_id
+			]
+			if same_frame_items:
+				selector_items = same_frame_items + [
+					(index, element) for index, element in selector_items if element.frame_id != historical_element.frame_id
+				]
 		highlight_index: int | None = None
 		match_level: MatchLevel | None = None
 
@@ -3496,7 +3569,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			hist_name = historical_element.node_name.lower()
 			matching_nodes = [
 				(idx, elem.node_name, elem.attributes.get('name') if elem.attributes else None)
-				for idx, elem in selector_map.items()
+				for idx, elem in selector_items
 				if elem.node_name.lower() == hist_name
 			]
 			self.logger.info(
@@ -3505,7 +3578,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			)
 
 		# Level 1: EXACT hash match
-		for idx, elem in selector_map.items():
+		for idx, elem in selector_items:
 			if elem.element_hash == historical_element.element_hash:
 				highlight_index = idx
 				match_level = MatchLevel.EXACT
@@ -3517,7 +3590,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Level 2: STABLE hash match (dynamic classes filtered)
 		# Use stored stable_hash (computed at save time from EnhancedDOMTreeNode - single source of truth)
 		if highlight_index is None and historical_element.stable_hash is not None:
-			for idx, elem in selector_map.items():
+			for idx, elem in selector_items:
 				if elem.compute_stable_hash() == historical_element.stable_hash:
 					highlight_index = idx
 					match_level = MatchLevel.STABLE
@@ -3530,7 +3603,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		# Level 3: XPATH match
 		if highlight_index is None and historical_element.x_path:
-			for idx, elem in selector_map.items():
+			for idx, elem in selector_items:
 				if elem.xpath == historical_element.x_path:
 					highlight_index = idx
 					match_level = MatchLevel.XPATH
@@ -3545,7 +3618,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if highlight_index is None and historical_element.ax_name:
 			hist_name = historical_element.node_name.lower()
 			hist_ax_name = historical_element.ax_name
-			for idx, elem in selector_map.items():
+			for idx, elem in selector_items:
 				# Match by node type and accessible name
 				elem_ax_name = elem.ax_node.name if elem.ax_node else None
 				if elem.node_name.lower() == hist_name and elem_ax_name == hist_ax_name:
@@ -3557,7 +3630,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				# Log available ax_names for debugging
 				same_type_ax_names = [
 					(idx, elem.ax_node.name if elem.ax_node else None)
-					for idx, elem in selector_map.items()
+					for idx, elem in selector_items
 					if elem.node_name.lower() == hist_name and elem.ax_node and elem.ax_node.name
 				]
 				self.logger.debug(
@@ -3574,7 +3647,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			# Try matching by unique identifiers: name, id, or aria-label
 			for attr_key in ['name', 'id', 'aria-label']:
 				if attr_key in hist_attrs and hist_attrs[attr_key]:
-					for idx, elem in selector_map.items():
+					for idx, elem in selector_items:
 						if (
 							elem.node_name.lower() == hist_name
 							and elem.attributes
@@ -3592,7 +3665,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				# Log what was tried and what's available on the page for debugging
 				same_node_elements = [
 					(idx, elem.attributes.get('aria-label') or elem.attributes.get('id') or elem.attributes.get('name'))
-					for idx, elem in selector_map.items()
+					for idx, elem in selector_items
 					if elem.node_name.lower() == hist_name and elem.attributes
 				]
 				self.logger.info(
@@ -3911,6 +3984,17 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					# Kill the browser session - this dispatches BrowserStopEvent,
 					# stops the EventBus with clear=True, and recreates a fresh EventBus
 					await self.browser_session.kill()
+				else:
+					# keep_alive=True sessions shouldn't keep the event loop alive after agent.run()
+					await self.browser_session.event_bus.stop(
+						clear=False,
+						timeout=_get_timeout('TIMEOUT_BrowserSessionEventBusStopOnAgentClose', 1.0),
+					)
+					try:
+						self.browser_session.event_bus.event_queue = None
+						self.browser_session.event_bus._on_idle = None
+					except Exception:
+						pass
 
 			# Close skill service if configured
 			if self.skill_service is not None:
@@ -4074,3 +4158,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					elif isinstance(item, dict):
 						count += self._substitute_in_dict(item, replacements)
 		return count
+
+
+_PythonAgent = Agent
